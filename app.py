@@ -12,14 +12,18 @@ from werkzeug.utils import secure_filename
 from pydub import AudioSegment
 import io
 import gc  # для очищення пам'яті
+from pathlib import Path
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # для роботи session
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB максимальний розмір запиту
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # Відключаємо кешування файлів
 
-# Директорії для файлів
-UPLOAD_FOLDER = "uploads"
-AUDIO_FOLDER = "audio_chunks"
-OUTPUT_FOLDER = "output"
+# Налаштування директорій для файлів - використовуємо системну тимчасову директорію
+TEMP_DIR = tempfile.gettempdir()
+UPLOAD_FOLDER = os.path.join(TEMP_DIR, "tts_uploads")
+AUDIO_FOLDER = os.path.join(TEMP_DIR, "tts_audio_chunks") 
+OUTPUT_FOLDER = os.path.join(TEMP_DIR, "tts_output")
 
 # Максимальний розмір файлу (5MB)
 MAX_FILE_SIZE = 5 * 1024 * 1024
@@ -59,6 +63,27 @@ VOICE_OPTIONS = [
     "en-GB-Standard-A",
     "ru-RU-Standard-A",
 ]
+
+# Функція для збереження вихідного аудіо
+def save_output_audio(final_audio, output_filename, session_id):
+    # Створюємо повний шлях до вихідного файлу
+    output_path = os.path.join(OUTPUT_FOLDER, f"{session_id}_{output_filename}")
+    
+    try:
+        # Зберігаємо аудіо
+        final_audio.export(output_path, format="mp3")
+        
+        # Перевіряємо, що файл був успішно створений
+        if not os.path.exists(output_path):
+            raise Exception("Файл не був створений")
+            
+        # Встановлюємо права доступу
+        os.chmod(output_path, 0o644)
+        
+        return output_path
+    except Exception as e:
+        print(f"Помилка збереження аудіо: {str(e)}")
+        raise
 
 # Розумне розбиття тексту по реченнях
 def split_text_by_sentences(text, max_chars=4800):
@@ -177,7 +202,8 @@ def index():
                     text = f.read()
             elif 'text_content' in request.form and request.form['text_content'].strip():
                 text = request.form['text_content']
-                file_path = os.path.join(UPLOAD_FOLDER, f"{session_id}_text.txt")
+                filename = "text.txt"
+                file_path = os.path.join(UPLOAD_FOLDER, f"{session_id}_{filename}")
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(text)
             else:
@@ -224,6 +250,9 @@ def index():
                 output_filename = os.path.splitext(os.path.basename(file_path))[0].replace(f"{session_id}_", "") + ".mp3"
                 output_path = os.path.join(OUTPUT_FOLDER, f"{session_id}_{output_filename}")
                 
+                # Створюємо байтовий буфер для зберігання аудіо в сесії
+                output_buffer = io.BytesIO()
+                
                 # Об'єднання аудіо блоками по 5 файлів для економії пам'яті
                 block_size = 5
                 for i in range(0, len(mp3_files), block_size):
@@ -238,6 +267,8 @@ def index():
                             del segment  # видалення для звільнення пам'яті
                             gc.collect()  # примусове очищення пам'яті
                         combined.export(output_path, format="mp3")
+                        # Також зберігаємо у буфер для сесії
+                        combined.export(output_buffer, format="mp3")
                         del combined
                         gc.collect()
                     # Для наступних - додаємо до існуючого
@@ -249,8 +280,15 @@ def index():
                             del segment
                             gc.collect()
                         existing.export(output_path, format="mp3")
+                        # Оновлюємо буфер
+                        output_buffer = io.BytesIO()
+                        existing.export(output_buffer, format="mp3")
                         del existing
                         gc.collect()
+                
+                # Зберігаємо аудіо-дані в сесії на випадок проблем з файловою системою
+                output_buffer.seek(0)
+                session['audio_data'] = output_buffer.getvalue()
                 
                 # Зберігання шляху у сесії
                 session['output_file'] = output_path
@@ -275,46 +313,120 @@ def index():
 
 @app.route('/download')
 def download():
-    if 'output_file' in session and 'output_filename' in session:
-        output_path = session['output_file']
-        output_filename = session['output_filename']
-        return send_file(output_path, as_attachment=True, download_name=output_filename)
-    else:
-        return "Файл не знайдено. Спробуйте знову створити аудіо."
+    try:
+        if 'output_file' in session and 'output_filename' in session:
+            output_path = session['output_file']
+            output_filename = session['output_filename']
+            
+            # Спочатку спробуємо використати файл з диску
+            if os.path.exists(output_path):
+                try:
+                    # Завантаження через IO буфер для запобігання проблем з файловою системою
+                    with open(output_path, 'rb') as f:
+                        file_data = f.read()
+                    
+                    # Створення відповіді з даними файлу
+                    buffer = io.BytesIO(file_data)
+                    
+                    # Відправка файлу з буфера
+                    return send_file(
+                        buffer,
+                        mimetype='audio/mp3',
+                        as_attachment=True,
+                        download_name=output_filename,
+                        max_age=0
+                    )
+                except Exception as e:
+                    print(f"Помилка при читанні файлу: {str(e)}")
+            
+            # Якщо файл недоступний, але є дані в сесії
+            if 'audio_data' in session:
+                buffer = io.BytesIO(session['audio_data'])
+                return send_file(
+                    buffer,
+                    mimetype='audio/mp3',
+                    as_attachment=True,
+                    download_name=output_filename,
+                    max_age=0
+                )
+            
+            return "Файл не знайдено. Спробуйте знову створити аудіо.", 404
+        else:
+            return "Інформація про файл відсутня в сесії. Спробуйте знову створити аудіо.", 404
+    except Exception as e:
+        print(f"Помилка завантаження: {str(e)}")
+        return f"Помилка під час завантаження: {str(e)}", 500
 
 @app.route('/play')
 def play():
-    if 'output_file' in session:
-        output_path = session['output_file']
-        return send_file(output_path, mimetype='audio/mp3')
-    else:
-        return "Файл не знайдено. Спробуйте знову створити аудіо."
+    try:
+        if 'output_file' in session:
+            output_path = session['output_file']
+            
+            # Спочатку спробуємо використати файл з диску
+            if os.path.exists(output_path):
+                try:
+                    # Завантаження через IO буфер для запобігання проблем з файловою системою
+                    with open(output_path, 'rb') as f:
+                        file_data = f.read()
+                    
+                    # Створення відповіді з даними файлу
+                    buffer = io.BytesIO(file_data)
+                    
+                    # Відправка файлу з буфера
+                    return send_file(
+                        buffer,
+                        mimetype='audio/mp3',
+                        conditional=True
+                    )
+                except Exception as e:
+                    print(f"Помилка при читанні файлу: {str(e)}")
+            
+            # Якщо файл недоступний, але є дані в сесії
+            if 'audio_data' in session:
+                buffer = io.BytesIO(session['audio_data'])
+                return send_file(
+                    buffer,
+                    mimetype='audio/mp3',
+                    conditional=True
+                )
+            
+            return "Файл не знайдено. Спробуйте знову створити аудіо.", 404
+        else:
+            return "Інформація про файл відсутня в сесії. Спробуйте знову створити аудіо.", 404
+    except Exception as e:
+        print(f"Помилка відтворення: {str(e)}")
+        return f"Помилка під час відтворення: {str(e)}", 500
 
 @app.route('/cleanup', methods=['POST'])
 def cleanup():
     # Очищення тимчасових файлів після завершення
-    if 'session_id' in session:
-        session_id = session['session_id']
-        session_audio_folder = os.path.join(AUDIO_FOLDER, session_id)
+    try:
+        if 'session_id' in session:
+            session_id = session['session_id']
+            session_audio_folder = os.path.join(AUDIO_FOLDER, session_id)
+            
+            # Видалення аудіофрагментів
+            if os.path.exists(session_audio_folder):
+                shutil.rmtree(session_audio_folder)
+            
+            # Видалення завантаженого файлу та вихідного аудіо
+            for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
+                for filename in os.listdir(folder):
+                    if filename.startswith(f"{session_id}_"):
+                        try:
+                            os.remove(os.path.join(folder, filename))
+                        except:
+                            pass
         
-        # Видалення аудіофрагментів
-        if os.path.exists(session_audio_folder):
-            shutil.rmtree(session_audio_folder)
-        
-        # Видалення завантаженого файлу та вихідного аудіо
-        for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
-            for filename in os.listdir(folder):
-                if filename.startswith(f"{session_id}_"):
-                    try:
-                        os.remove(os.path.join(folder, filename))
-                    except:
-                        pass
-    
-    # Очищення сесії
-    session.clear()
-    
-    # Примусове очищення пам'яті
-    gc.collect()
+        # Очищення сесії
+        if 'audio_data' in session:
+            del session['audio_data']
+            
+        # Примусове очищення пам'яті
+        gc.collect()
+    except Exception as e:
+        print(f"Помилка при очищенні: {str(e)}")
     
     return "OK"
 
