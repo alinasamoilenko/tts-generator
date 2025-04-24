@@ -1,0 +1,30 @@
+# Системні файли
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+
+# Файли, згенеровані додатком
+uploads/
+audio_chunks/
+output/
+*.mp3
+*.wav
+
+# Google Cloud credentials
+credentials.json
+
+# Кеш IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Логи
+*.log
